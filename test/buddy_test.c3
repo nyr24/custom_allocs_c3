@@ -7,7 +7,7 @@ import std::math, std::io;
 
 fn void mem_zero()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem, 1024, 512, 256);
 	defer buddy.free();
 	Allocator a = (Allocator)&buddy;
@@ -36,7 +36,7 @@ fn void mem_zero()
 
 fn void test_list()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem);
 	defer buddy.free();
 	Allocator a = (Allocator)&buddy;
@@ -63,7 +63,7 @@ fn void test_list()
 
 fn void test_map()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem);
 	defer buddy.free();
 	Allocator a = (Allocator)&buddy;
@@ -90,7 +90,7 @@ fn void test_map()
 
 fn void test_dstring()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem);
 	defer buddy.free();
 
@@ -123,7 +123,7 @@ fn void test_dstring()
 
 fn void increasing_sizes()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem, 4096, 1024, 256);
 	defer buddy.free();
 	Allocator a = (Allocator)&buddy;
@@ -154,7 +154,7 @@ fn void increasing_sizes()
 
 fn void decreasing_sizes()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem, 2048, 1024);
 	defer buddy.free();
 	Allocator a = (Allocator)&buddy;
@@ -184,7 +184,7 @@ fn void decreasing_sizes()
 
 fn void test_aligned_allocations()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem, 2048, 1024);
 	defer buddy.free();
 	Allocator a = (Allocator)&buddy;
@@ -225,7 +225,7 @@ fn void test_aligned_allocations()
 
 fn void single_alloc_filling_entire_buf()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem, 2048);
 	defer buddy.free();
 	Allocator a = (Allocator)&buddy;
@@ -242,7 +242,7 @@ fn void single_alloc_filling_entire_buf()
 
 fn void more_allocs()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem, 2048, 1024);
 	defer buddy.free();
 	Allocator a = (Allocator)&buddy;
@@ -278,7 +278,7 @@ fn void more_allocs()
 
 fn void batches_increasing_size()
 {
-	BuddyAlloc buddy;
+	BuddyAllocator buddy;
 	buddy.init(mem, 4096, 1024, 256);
 	defer buddy.free();
 

@@ -129,7 +129,7 @@ fn void*? ArenaAlloc.resize(&self, void* ptr, sz new_size, sz alignment = 0) @dy
 {
 $if THREAD_SAFE:
 	self.mutex.lock();
-	defer self.mutex.lock();
+	defer self.mutex.unlock();
 $endif
 
 	sz aligned_new_size = mem::aligned_offset(new_size, mem::DEFAULT_MEM_ALIGNMENT);

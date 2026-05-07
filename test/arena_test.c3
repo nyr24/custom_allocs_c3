@@ -5,7 +5,7 @@ import std::collections::map;
 
 fn void temp_scope()
 {
-	ArenaAlloc arena;
+	Arena arena;
 	arena.init(mem);
 	defer arena.free();
 
@@ -31,7 +31,7 @@ fn void temp_scope()
 
 fn void map_test()
 {
-	ArenaAlloc arena;
+	Arena arena;
 	arena.init(mem);
 	defer arena.free();
 	Allocator a = &arena;

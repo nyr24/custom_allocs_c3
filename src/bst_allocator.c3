@@ -100,7 +100,7 @@ $endif
 	self.data = (char*)alloc::alloc_with_padding(backing_alloc, AllocHeader, self.capacity)!!;
 	self.backing_alloc = backing_alloc;
 	self.strategy = strategy;
-	self.reset();
+	_reset(self);
 }
 
 <*
@@ -300,6 +300,14 @@ $if THREAD_SAFE:
 	self.mutex.lock();
 	defer self.mutex.unlock();
 $endif
+	_reset(self);
+}
+
+<*
+ Non-locking body of 'reset' procedure.
+*>
+macro void _reset(BSTAlloc* self)
+{
 	self.root = (FreeNode*)self.data;
 	init_node(self.root, self.capacity, null);
 }

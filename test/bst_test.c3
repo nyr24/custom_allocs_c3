@@ -7,7 +7,7 @@ import std::collections::map;
 
 fn void sequential_alloc_free()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem, 4096, BEST_FIT);
 	defer bst_alloc.free();
 
@@ -37,7 +37,7 @@ fn void sequential_alloc_free()
 
 fn void mem_zero()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem);
 	defer bst_alloc.free();
 	Allocator a = (Allocator)&bst_alloc;
@@ -66,7 +66,7 @@ fn void mem_zero()
 
 fn void test_list()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem);
 	defer bst_alloc.free();
 	Allocator a = (Allocator)&bst_alloc;
@@ -93,7 +93,7 @@ fn void test_list()
 
 fn void test_map()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem);
 	defer bst_alloc.free();
 	Allocator a = (Allocator)&bst_alloc;
@@ -120,7 +120,7 @@ fn void test_map()
 
 fn void test_dstring()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem);
 	defer bst_alloc.free();
 	Allocator a = (Allocator)&bst_alloc;
@@ -152,7 +152,7 @@ fn void test_dstring()
 
 fn void more_allocs()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem, 2048);
 	defer bst_alloc.free();
 	Allocator a = (Allocator)&bst_alloc;
@@ -200,7 +200,7 @@ fn void more_allocs()
 
 fn void zeroing_memory()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem, 1024);
 	defer bst_alloc.free();
 	Allocator a = (Allocator)&bst_alloc;
@@ -218,7 +218,7 @@ fn void zeroing_memory()
 
 fn void test_aligned_allocations()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem, 2048, BEST_FIT);
 	defer bst_alloc.free();
 	Allocator a = (Allocator)&bst_alloc;
@@ -259,7 +259,7 @@ fn void test_aligned_allocations()
 
 fn void single_alloc_filling_entire_buf()
 {
-	BSTAlloc bst_alloc;
+	BSTAllocator bst_alloc;
 	bst_alloc.init(mem, 2048, BEST_FIT);
 	defer bst_alloc.free();
 	Allocator a = (Allocator)&bst_alloc;
