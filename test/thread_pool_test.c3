@@ -12,7 +12,7 @@ fn void task_background(TaskData task)
 {
 	String f_name = *(String*)task.arg;
 
-	Arena* arena = (Arena*)task.alloc;
+	ThreadArena* arena = (ThreadArena*)task.alloc;
 
 	arena.@temp_scope(; alloc)
 	{
@@ -29,8 +29,6 @@ fn void task_background(TaskData task)
 			*n = i + 10;
 		}
 
-		io::printfn("ints: %s", ints[..]);
-	
 		Atomic{sz} line_count;
 		Atomic{sz} a_line_count;
 		line_count.store(0);
@@ -46,8 +44,6 @@ fn void task_background(TaskData task)
 			}
 			line_count.add(1);
 		}
-
-		io::printfn("IO task finished, line count: %d %d", line_count.load(), a_line_count.load());
 	};
 }
 
@@ -75,13 +71,11 @@ fn void task_computation(TaskData task)
 {
 	int start = *(int*)task.arg;
 	int next_p = next_prime(start);
-
-	io::printfn("COMPUTE task finished, next prime from: %s is: %s", start, next_p);
 }
 
 fn void thread_pool_test() @test
 {
-	Arena thread_alloc;
+	ThreadArena thread_alloc;
 	thread_alloc.init(mem, 1ull << 32);
 
 	ThreadPool{8, 1} pool;
@@ -89,7 +83,6 @@ fn void thread_pool_test() @test
 
 	defer {
 		pool.stop_and_destroy();
-		io::printn(thread_alloc);
 		thread_alloc.free();
 	}
 

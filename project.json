@@ -9,10 +9,10 @@
   "build-dir": "build",
   "output": "build",
   "targets": {
-    "arena_alloc": {
+    "custom_allocators": {
       "type": "static-lib",
     },
-    "arena_alloc_dyn": {
+    "custom_allocators_dyn": {
       "type": "dynamic-lib",
     },
   },
