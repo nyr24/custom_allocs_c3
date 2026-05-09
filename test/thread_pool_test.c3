@@ -1,77 +1,9 @@
-module thread_pool_test;
-
+module thread_pool_test @test;
 import data_structures::thread_pool;
 import custom_allocators::arena;
-
-import std::time;
 import std::math;
+import std::time;
 import std::io;
-import std::atomic;
-
-fn void task_background(TaskData task) 
-{
-	String f_name = *(String*)task.data;
-
-	ThreadArena* arena = (ThreadArena*)task.alloc;
-
-	arena.@temp_scope(; alloc)
-	{
-		String contents = (String)file::load(alloc, f_name)!!;
-
-		sz[] ints = alloc::alloc_array(alloc, sz, 10);
-		foreach (i, &n : ints)
-		{
-			*n = i;
-		}
-		ints = alloc::realloc_array(alloc, ints, sz, 20);
-		foreach (i, &n : ints[10:10])
-		{
-			*n = i + 10;
-		}
-
-		Atomic{sz} line_count;
-		Atomic{sz} a_line_count;
-		line_count.store(0);
-		a_line_count.store(0);
-
-		Splitter splitter = contents.tokenize("\n");
-	
-		while (try line = splitter.next())
-		{
-			if (line[0] == 'a')
-			{
-				a_line_count.add(1);
-			}
-			line_count.add(1);
-		}
-	};
-}
-
-fn bool is_prime(int x)
-{
-    if (x < 2) return false;
-    for (int i = 2; i < x; ++i)
-    {
-        if (x % i == 0)
-		{
-            return false;
-		}
-    }
-    return true;
-}
-
-fn int next_prime(int x)
-{
-    for (; !is_prime(x); ++x)
-	{}
-    return x;
-}
-
-fn void task_computation(TaskData task) 
-{
-	int start = *(int*)task.data;
-	int next_p = next_prime(start);
-}
 
 const String[*] FILE_NAMES = {
 	"resources/input0.txt",
@@ -127,4 +59,124 @@ fn void general() @test
 
 	pool.submit_task_many(io_tasks[..]);
 	pool.submit_task_many(compute_tasks[..]);
+}
+
+fn void await_test() @test
+{
+	ThreadArena thread_alloc;
+	thread_alloc.init(mem, 1ull << 32);
+
+	ThreadPool{2, 2} pool;
+	pool.init()!!;
+
+	defer {
+		pool.stop_and_destroy();
+		io::printn(thread_alloc);
+		thread_alloc.free();
+	}
+
+	const TASK_COUNT = FILE_NAMES.len;
+
+	// First portion
+	ThreadTask[TASK_COUNT / 2] io_tasks_first;
+	
+	foreach (i, &task : io_tasks_first)
+	{
+		task.func = &task_background;
+		// task.data = (void*)&FILE_NAMES[i];
+		task.data = (void*)&FILE_NAMES[i + TASK_COUNT / 2];
+		task.alloc = &thread_alloc;
+		task.priority = LOW;
+	}
+
+	pool.submit_task_many(io_tasks_first[..]);
+	pool.await_with_priority(LOW);
+	
+	// Second Portion
+	ThreadTask[TASK_COUNT / 2] io_tasks_second;
+	
+	foreach (i, &task : io_tasks_second)
+	{
+		task.func = &task_background;
+		// task.data = (void*)&FILE_NAMES[i + TASK_COUNT / 2];
+		task.data = (void*)&FILE_NAMES[i];
+		task.alloc = &thread_alloc;
+		task.priority = LOW;
+	}
+
+	pool.submit_task_many(io_tasks_second[..]);
+	pool.await_with_priority(LOW);
+}
+
+module thread_pool_test;
+import std::time;
+import std::math;
+import std::io;
+import custom_allocators::arena;
+import data_structures::thread_pool;
+import std::atomic;
+
+fn void task_background(TaskData task)
+{
+	String f_name = *(String*)task.data;
+
+	ThreadArena* arena = (ThreadArena*)task.alloc;
+
+	arena.@temp_scope(; alloc)
+	{
+		String contents = (String)file::load(alloc, f_name)!!;
+
+		sz[] ints = alloc::alloc_array(alloc, sz, 10);
+		foreach (i, &n : ints)
+		{
+			*n = i;
+		}
+		ints = alloc::realloc_array(alloc, ints, sz, 20);
+		foreach (i, &n : ints[10:10])
+		{
+			*n = i + 10;
+		}
+
+		Atomic{sz} line_count;
+		Atomic{sz} a_line_count;
+		line_count.store(0);
+		a_line_count.store(0);
+
+		Splitter splitter = contents.tokenize("\n");
+	
+		while (try line = splitter.next())
+		{
+			if (line[0] == 'a')
+			{
+				a_line_count.add(1);
+			}
+			line_count.add(1);
+		}
+	};
+}
+
+fn void task_computation(TaskData task) 
+{
+	int start = *(int*)task.data;
+	int next_p = next_prime(start);
+}
+
+fn bool is_prime(int x)
+{
+    if (x < 2) return false;
+    for (int i = 2; i < x; ++i)
+    {
+        if (x % i == 0)
+		{
+            return false;
+		}
+    }
+    return true;
+}
+
+fn int next_prime(int x)
+{
+    for (; !is_prime(x); ++x)
+	{}
+    return x;
 }

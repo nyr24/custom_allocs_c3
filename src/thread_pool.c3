@@ -2,6 +2,8 @@ module data_structures::thread_pool;
 
 import std::thread;
 
+const THREAD_TEMP_MEM_AMOUNT = 1 << 24; // 16MB
+
 <*
  User should fill this structure to submit a task.
 *>
@@ -46,8 +48,7 @@ struct PoolData @private
 		bool initialized : 0..0;
 		bool stop : 1..1;
 		bool stop_now : 2..2;
-		bool joining : 3..3;
-		sz busy_thread_count : 4..(bitsizeof(sz) - 1);
+		sz busy_thread_count : 3..(bitsizeof(sz) - 1);
 	}
 }
 
@@ -66,6 +67,9 @@ enum TaskPriority : (ThreadPriority thread_prio)
 
 alias ThreadFn = fn void(TaskData task_data);
 
+<*
+ @require HIGH_CAP >= 1 && LOW_CAP >= 1 : "Should be at least 1 thread"
+*>
 module data_structures::thread_pool <HIGH_CAP, LOW_CAP>;
 import std::thread;
 import std::collections::ringbuffer;
@@ -123,54 +127,52 @@ fn void? ThreadPool.init(&self, sz stack_size_low = 0, sz stack_size_high = 0)
 }
 
 <*
- Join all threads in the pool.
+ Awaits all tasks in both queues.
 
  @require self.high_pool.initialized : "Must be initialzied"
  @require self.low_pool.initialized : "Must be initialzied"
 *>
-fn void ThreadPool.join_all(&self)
+fn void ThreadPool.await_all(&self)
 {
 	PoolData* pool = &self.high_pool;
 
-	while (pool.busy_thread_count > 0)
 	{
 		pool.mutex.lock();
-		pool.joining = true;
-		pool.cond_task_acquired.broadcast();
-		pool.cond_collect.wait(&pool.mutex);
-		pool.joining = false;
-		pool.mutex.unlock();
+		defer pool.mutex.unlock();
+		while (self.high_queue.len() > 0)
+		{
+			pool.cond_task_finished.wait(&pool.mutex);
+		}
 	}
 
 	pool = &self.low_pool;
 	
-	while (pool.busy_thread_count > 0)
 	{
 		pool.mutex.lock();
-		pool.joining = true;
-		pool.cond_task_acquired.broadcast();
-		pool.cond_collect.wait(&pool.mutex);
-		pool.joining = false;
-		pool.mutex.unlock();
+		defer pool.mutex.unlock();
+		while (self.low_queue.len() > 0)
+		{
+			pool.cond_task_finished.wait(&pool.mutex);
+		}
 	}
 }
 
 <*
- Join all threads with certain priority in the pool.
-*>
-fn void ThreadPool.join_by_priority(&self, TaskPriority priority)
-{
-	PoolData* pool = &((PoolData*)&self.high_pool)[priority];
-	assert(pool.initialized, "Must be initialized");
+ Awaits all tasks in the queue with specified priority.
 
-	while (pool.busy_thread_count > 0)
+ @require self.high_pool.initialized : "Must be initialzied"
+ @require self.low_pool.initialized : "Must be initialzied"
+*>
+fn void ThreadPool.await_with_priority(&self, TaskPriority priority)
+{
+	PoolData* pool = &(&self.high_pool)[priority];
+	var queue @safeinfer = &(&self.high_queue)[priority];
+
+	pool.mutex.lock();
+	defer pool.mutex.unlock();
+	while (queue.len() > 0)
 	{
-		pool.mutex.lock();
-		pool.joining = true;
-		pool.cond_task_acquired.broadcast();
-		pool.cond_collect.wait(&pool.mutex);
-		pool.joining = false;
-		pool.mutex.unlock();
+		pool.cond_task_finished.wait(&pool.mutex);
 	}
 }
 
@@ -236,35 +238,37 @@ fn int process_high_prio_task(void* arg) @local
 	ThreadPool* self = (ThreadPool*)arg;
 	PoolData* pool = &self.high_pool;
 
-	while (true)
+	@pool_init(mem, THREAD_TEMP_MEM_AMOUNT)
 	{
-		pool.mutex.lock();
-		// Wait for work.
-		while (self.high_queue.is_empty())
+		while (true)
 		{
-			if (pool.joining) pool.cond_collect.broadcast();
-			if (pool.stop)
+			pool.mutex.lock();
+			// Wait for work.
+			while (self.high_queue.is_empty())
 			{
-				// Shutdown requested.
-				pool.busy_thread_count--;
-				pool.mutex.unlock();
-				return 0;
+				if (pool.stop)
+				{
+					// Shutdown requested.
+					pool.busy_thread_count--;
+					pool.mutex.unlock();
+					return 0;
+				}
+				pool.cond_task_acquired.wait(&pool.mutex);
+				if (pool.stop_now)
+				{
+					// Shutdown requested.
+					pool.busy_thread_count--;
+					pool.mutex.unlock();
+					return 0;
+				}
 			}
-			pool.cond_task_acquired.wait(&pool.mutex);
-			if (pool.stop_now)
-			{
-				// Shutdown requested.
-				pool.busy_thread_count--;
-				pool.mutex.unlock();
-				return 0;
-			}
+			ThreadTaskPrivate task = self.high_queue.pop_first()!!;
+			pool.mutex.unlock();
+			// Process the task.
+			task.func((TaskData){ task.data, task.alloc });
+			pool.cond_task_finished.signal();
 		}
-		ThreadTaskPrivate task = self.high_queue.pop_first()!!;
-		pool.mutex.unlock();
-		// Process the task.
-		task.func((TaskData){ task.data, task.alloc });
-		pool.cond_task_finished.broadcast();
-	}
+	};
 }
 
 <*
@@ -275,8 +279,7 @@ fn int process_low_prio_task(void* arg) @local
 	ThreadPool* self = arg;
 	PoolData* pool = &self.low_pool;
 
-	// NOTE: TEMP
-	@pool_init(mem, 1 << 30)
+	@pool_init(mem, THREAD_TEMP_MEM_AMOUNT)
 	{
 		while (true)
 		{
@@ -284,7 +287,6 @@ fn int process_low_prio_task(void* arg) @local
 			// Wait for work.
 			while (self.low_queue.is_empty())
 			{
-				if (pool.joining) pool.cond_collect.broadcast();
 				if (pool.stop)
 				{
 					// Shutdown requested.
@@ -305,7 +307,7 @@ fn int process_low_prio_task(void* arg) @local
 			pool.mutex.unlock();
 			// Process the task.
 			task.func((TaskData){ task.data, task.alloc });
-			pool.cond_task_finished.broadcast();
+			pool.cond_task_finished.signal();
 		}
 	};
 }
