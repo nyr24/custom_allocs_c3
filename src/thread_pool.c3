@@ -2,35 +2,21 @@ module data_structures::thread_pool;
 
 import std::thread;
 
-const THREAD_TEMP_MEM_AMOUNT = 1 << 24; // 16MB
+const THREAD_TEMP_MEM_AMOUNT = 1 << 18; // 262kb
 
-<*
- User should fill this structure to submit a task.
-*>
 struct ThreadTask
 {
-	inline ThreadTaskPrivate _task;
-	TaskPriority priority;
-}
-
-<*
- Passed into the task as argument.
- Accessed by user code.
-*>
-struct TaskData
-{
-	void* data;
-	Allocator alloc;
-}
-
-<*
- Used internally to store a task.
-*>
-struct ThreadTaskPrivate @private
-{
 	ThreadFn func;
-	void* data;
-	Allocator alloc;
+	void* arg;
+}
+
+<*
+ User should fill this structure to submit multiple tasks.
+*>
+struct ThreadTaskPack
+{
+	TaskPriority priority;
+	ThreadTask[] tasks;
 }
 
 <*
@@ -48,7 +34,7 @@ struct PoolData @private
 		bool initialized : 0..0;
 		bool stop : 1..1;
 		bool stop_now : 2..2;
-		sz busy_thread_count : 3..(bitsizeof(sz) - 1);
+		sz alive_thread_count : 3..(bitsizeof(sz) - 1);
 	}
 }
 
@@ -65,13 +51,14 @@ enum TaskPriority : (ThreadPriority thread_prio)
 	HIGH { REALTIME },
 }
 
-alias ThreadFn = fn void(TaskData task_data);
+alias ThreadFn = fn void(void* task_data);
 
 <*
- @require HIGH_CAP >= 1 && LOW_CAP >= 1 : "Should be at least 1 thread"
+ @require HIGH_THREADS > 0 && LOW_THREADS > 0 && HIGH_TASKS > 0 && LOW_TASKS > 0 : "Should be at least 1"
 *>
-module data_structures::thread_pool <HIGH_CAP, LOW_CAP>;
-import std::thread;
+module data_structures::thread_pool <HIGH_THREADS, LOW_THREADS, HIGH_TASKS, LOW_TASKS>;
+import std::thread @norecurse;
+import std::math @norecurse;
 import std::collections::ringbuffer;
 
 <*
@@ -81,28 +68,44 @@ struct ThreadPool
 {
 	PoolData high_pool;
 	PoolData low_pool;
-	RingBuffer{ThreadTaskPrivate, HIGH_CAP} high_queue;
-	RingBuffer{ThreadTaskPrivate, LOW_CAP} low_queue;
-	Thread[HIGH_CAP] high_threads;
-	Thread[LOW_CAP] low_threads;
+	RingBuffer{ThreadTask, HIGH_TASKS} high_queue;
+	RingBuffer{ThreadTask, LOW_TASKS} low_queue;
+	Thread[HIGH_THREADS] high_threads;
+	Thread[LOW_THREADS] low_threads;
+	bool[<HIGH_THREADS>] high_threads_working;
+	bool[<LOW_THREADS>] low_threads_working;
+}
+
+<*
+ Passed to the thread upon creation.
+*>
+struct ThreadCreateData @local
+{
+	ThreadPool* tpool;
+	// Corresponds to '_threads_working' array
+	sz index;
+	Allocator mem;
+	Allocator tmem;
 }
 
 <*
  @require !self.is_initialized() : "Pools must not be already initialized"
 *>
-fn void? ThreadPool.init(&self, sz stack_size_low = 0, sz stack_size_high = 0)
+fn void? ThreadPool.init(&self, Allocator thread_main_alloc = mem, Allocator thread_temp_alloc = tmem, sz stack_size_low = 0, sz stack_size_high = 0)
 {
 	defer catch self.destroy();
 
 	PoolData* pool = &self.high_pool;
-	*pool = { .busy_thread_count = HIGH_CAP, .initialized = true };
+	pool.alive_thread_count = HIGH_THREADS;
+	pool.initialized = true;
 	pool.mutex.init()!;
 	pool.cond_task_acquired.init()!;
 	pool.cond_task_finished.init()!;
 	pool.cond_collect.init()!;
 
 	pool = &self.low_pool;
-	*pool = { .busy_thread_count = LOW_CAP, .initialized = true };
+	pool.alive_thread_count = LOW_THREADS;
+	pool.initialized = true;
 	pool.mutex.init()!;
 	pool.cond_task_acquired.init()!;
 	pool.cond_task_finished.init()!;
@@ -110,17 +113,22 @@ fn void? ThreadPool.init(&self, sz stack_size_low = 0, sz stack_size_high = 0)
 
 	self.high_queue.init();
 	self.low_queue.init();
-	
-	foreach (&thread : self.high_threads)
+
+	self.high_threads_working = {};
+	self.low_threads_working = {};
+
+	foreach (i, &thread : self.high_threads)
 	{
-		thread.create(&process_high_prio_task, self, { stack_size_high, TaskPriority.HIGH.thread_prio })!;
+		ThreadCreateData thread_data = { self, i, thread_main_alloc, thread_temp_alloc };
+		thread.create(&process_high_prio_task, &thread_data, { stack_size_high, TaskPriority.HIGH.thread_prio })!;
 		// The thread resources will be cleaned up when the thread exits.
 		thread.detach()!;
 	}
 	
-	foreach (&thread : self.low_threads)
+	foreach (i, &thread : self.low_threads)
 	{
-		thread.create(&process_low_prio_task, self, { stack_size_low, TaskPriority.LOW.thread_prio })!;
+		ThreadCreateData thread_data = { self, i, thread_main_alloc, thread_temp_alloc };
+		thread.create(&process_low_prio_task, &thread_data, { stack_size_low, TaskPriority.LOW.thread_prio })!;
 		// The thread resources will be cleaned up when the thread exits.
 		thread.detach()!;
 	}
@@ -129,8 +137,7 @@ fn void? ThreadPool.init(&self, sz stack_size_low = 0, sz stack_size_high = 0)
 <*
  Awaits all tasks in both queues.
 
- @require self.high_pool.initialized : "Must be initialzied"
- @require self.low_pool.initialized : "Must be initialzied"
+ @require self.is_initialized() : "Pools must be already initialized"
 *>
 fn void ThreadPool.await_all(&self)
 {
@@ -139,18 +146,18 @@ fn void ThreadPool.await_all(&self)
 	{
 		pool.mutex.lock();
 		defer pool.mutex.unlock();
-		while (self.high_queue.len() > 0)
+		while (!self.high_queue.is_empty() || self.high_threads_working.or())
 		{
 			pool.cond_task_finished.wait(&pool.mutex);
 		}
 	}
 
 	pool = &self.low_pool;
-	
+
 	{
 		pool.mutex.lock();
 		defer pool.mutex.unlock();
-		while (self.low_queue.len() > 0)
+		while (!self.low_queue.is_empty() || self.low_threads_working.or())
 		{
 			pool.cond_task_finished.wait(&pool.mutex);
 		}
@@ -160,46 +167,40 @@ fn void ThreadPool.await_all(&self)
 <*
  Awaits all tasks in the queue with specified priority.
 
- @require self.high_pool.initialized : "Must be initialzied"
- @require self.low_pool.initialized : "Must be initialzied"
+ @require self.is_initialized() : "Pools must be already initialized"
 *>
 fn void ThreadPool.await_with_priority(&self, TaskPriority priority)
 {
-	PoolData* pool = &(&self.high_pool)[priority];
-	var queue @safeinfer = &(&self.high_queue)[priority];
-
-	pool.mutex.lock();
-	defer pool.mutex.unlock();
-	while (queue.len() > 0)
+	if (priority == HIGH)
 	{
-		pool.cond_task_finished.wait(&pool.mutex);
+		PoolData* pool = &self.high_pool;
+		pool.mutex.lock();
+		defer pool.mutex.unlock();
+
+		while (!self.high_queue.is_empty() || self.high_threads_working.or())
+		{
+			pool.cond_task_finished.wait(&pool.mutex);
+		}
+	}
+	else
+	{
+		PoolData* pool = &self.low_pool;
+		pool.mutex.lock();
+		defer pool.mutex.unlock();
+
+		while (!self.low_queue.is_empty() || self.low_threads_working.or())
+		{
+			pool.cond_task_finished.wait(&pool.mutex);
+		}
 	}
 }
 
 <*
  Submits a new task to the pool.
 *>
-fn void ThreadPool.submit_task(&self, ThreadTask task)
+fn void ThreadPool.submit_task(&self, ThreadTask task, TaskPriority priority)
 {
-	if (task.priority == LOW)
-	{
-		PoolData* pool = &self.low_pool;
-		pool.mutex.lock();
-		defer pool.mutex.unlock();
-
-		while (true)
-		{
-			if (!self.low_queue.is_full())
-			{
-				self.low_queue.push(task);
-				// cond_task_acquired the thread that work is available.
-				pool.cond_task_acquired.signal();
-				return;
-			}
-			pool.cond_task_finished.wait(&pool.mutex);
-		}
-	}
-	else
+	if (priority == HIGH)
 	{
 		PoolData* pool = &self.high_pool;
 		pool.mutex.lock();
@@ -210,8 +211,26 @@ fn void ThreadPool.submit_task(&self, ThreadTask task)
 			if (!self.high_queue.is_full())
 			{
 				self.high_queue.push(task);
-				// cond_task_acquired the thread that work is available.
-				pool.cond_task_acquired.signal();
+				// signal the thread that work is available.
+				pool.cond_task_acquired.broadcast();
+				return;
+			}
+			pool.cond_task_finished.wait(&pool.mutex);
+		}
+	}
+	else
+	{
+		PoolData* pool = &self.low_pool;
+		pool.mutex.lock();
+		defer pool.mutex.unlock();
+
+		while (true)
+		{
+			if (!self.low_queue.is_full())
+			{
+				self.low_queue.push(task);
+				// signal the thread that work is available.
+				pool.cond_task_acquired.broadcast();
 				return;
 			}
 			pool.cond_task_finished.wait(&pool.mutex);
@@ -222,11 +241,59 @@ fn void ThreadPool.submit_task(&self, ThreadTask task)
 <*
  Submits multiple tasks to the pool.
 *>
-fn void ThreadPool.submit_task_many(&self, ThreadTask[] tasks)
+fn void ThreadPool.submit_task_many(&self, ThreadTaskPack[] task_packs)
 {
-	foreach (j : tasks)
+	PoolData* pool = null;
+	sz pushed = 0;
+	sz new_pushed = 0;
+	sz remain = 0;
+
+	foreach OUT: (pack : task_packs)
 	{
-		self.submit_task(j);
+		if (pack.priority == HIGH)
+		{
+			pool = &self.high_pool;
+			pushed = 0;
+			new_pushed = 0;
+			remain = 0;
+
+			pool.mutex.lock();
+			defer pool.mutex.unlock();
+
+			while (true)
+			{
+				remain = self.high_queue.buf.len - self.high_queue.len();
+				new_pushed = math::min(pack.tasks.len - pushed, remain);
+				self.high_queue.push_all(pack.tasks[pushed:new_pushed]);
+				// signal the thread that work is available.
+				pool.cond_task_acquired.broadcast();
+				pushed = new_pushed;
+				if (pushed == pack.tasks.len) continue OUT;
+				pool.cond_task_finished.wait(&pool.mutex);
+			}
+		}
+		else
+		{
+			pool = &self.low_pool;
+			pushed = 0;
+			new_pushed = 0;
+			remain = 0;
+
+			pool.mutex.lock();
+			defer pool.mutex.unlock();
+
+			while (true)
+			{
+				remain = self.low_queue.buf.len - self.low_queue.len();
+				new_pushed = math::min(pack.tasks.len - pushed, remain);
+				self.low_queue.push_all(pack.tasks[pushed:new_pushed]);
+				// signal the thread that work is available.
+				pool.cond_task_acquired.broadcast();
+				pushed = new_pushed;
+				if (pushed == pack.tasks.len) continue OUT;
+				pool.cond_task_finished.wait(&pool.mutex);
+			}
+		}
 	}
 }
 
@@ -235,10 +302,15 @@ fn void ThreadPool.submit_task_many(&self, ThreadTask[] tasks)
 *>
 fn int process_high_prio_task(void* arg) @local
 {
-	ThreadPool* self = (ThreadPool*)arg;
+	ThreadCreateData* thread_data = arg;
+	sz thread_index = thread_data.index;
+	ThreadPool* self = thread_data.tpool;
 	PoolData* pool = &self.high_pool;
 
-	@pool_init(mem, THREAD_TEMP_MEM_AMOUNT)
+	mem = thread_data.mem;
+	tmem = thread_data.tmem;
+
+	@pool_init(tmem, THREAD_TEMP_MEM_AMOUNT)
 	{
 		while (true)
 		{
@@ -249,24 +321,28 @@ fn int process_high_prio_task(void* arg) @local
 				if (pool.stop)
 				{
 					// Shutdown requested.
-					pool.busy_thread_count--;
+					pool.alive_thread_count--;
 					pool.mutex.unlock();
 					return 0;
 				}
+
+				self.high_threads_working[thread_index] = false;
 				pool.cond_task_acquired.wait(&pool.mutex);
+
 				if (pool.stop_now)
 				{
 					// Shutdown requested.
-					pool.busy_thread_count--;
+					pool.alive_thread_count--;
 					pool.mutex.unlock();
 					return 0;
 				}
 			}
-			ThreadTaskPrivate task = self.high_queue.pop_first()!!;
+			ThreadTask task = self.high_queue.pop_first()!!;
+			self.high_threads_working[thread_index] = true;
 			pool.mutex.unlock();
 			// Process the task.
-			task.func((TaskData){ task.data, task.alloc });
-			pool.cond_task_finished.signal();
+			task.func(task.arg);
+			pool.cond_task_finished.broadcast();
 		}
 	};
 }
@@ -276,10 +352,15 @@ fn int process_high_prio_task(void* arg) @local
 *>
 fn int process_low_prio_task(void* arg) @local
 {
-	ThreadPool* self = arg;
+	ThreadCreateData* thread_data = arg;
+	sz thread_index = thread_data.index;
+	ThreadPool* self = thread_data.tpool;
 	PoolData* pool = &self.low_pool;
 
-	@pool_init(mem, THREAD_TEMP_MEM_AMOUNT)
+	mem = thread_data.mem;
+	tmem = thread_data.tmem;
+
+	@pool_init(tmem, THREAD_TEMP_MEM_AMOUNT)
 	{
 		while (true)
 		{
@@ -290,24 +371,28 @@ fn int process_low_prio_task(void* arg) @local
 				if (pool.stop)
 				{
 					// Shutdown requested.
-					pool.busy_thread_count--;
+					pool.alive_thread_count--;
 					pool.mutex.unlock();
 					return 0;
 				}
+
+				self.low_threads_working[thread_index] = false;
 				pool.cond_task_acquired.wait(&pool.mutex);
+
 				if (pool.stop_now)
 				{
 					// Shutdown requested.
-					pool.busy_thread_count--;
+					pool.alive_thread_count--;
 					pool.mutex.unlock();
 					return 0;
 				}
 			}
-			ThreadTaskPrivate task = self.low_queue.pop_first()!!;
+			ThreadTask task = self.low_queue.pop_first()!!;
+			self.low_threads_working[thread_index] = true;
 			pool.mutex.unlock();
 			// Process the task.
-			task.func((TaskData){ task.data, task.alloc });
-			pool.cond_task_finished.signal();
+			task.func(task.arg);
+			pool.cond_task_finished.broadcast();
 		}
 	};
 }
@@ -319,8 +404,8 @@ fn int process_low_prio_task(void* arg) @local
 *>
 fn void ThreadPool.destroy(&self)
 {
-	@shutdown(self.high_pool, self.high_pool.stop_now);
-	@shutdown(self.low_pool, self.low_pool.stop_now);
+	@shutdown(self, &self.high_pool, self.high_pool.stop_now);
+	@shutdown(self, &self.low_pool, self.low_pool.stop_now);
 }
 
 <*
@@ -337,33 +422,33 @@ fn bool ThreadPool.is_initialized(&self)
 *>
 fn void ThreadPool.stop_and_destroy(&self)
 {
-	@shutdown(self.high_pool, self.high_pool.stop);
-	@shutdown(self.low_pool, self.low_pool.stop);
+	@shutdown(self, &self.high_pool, self.high_pool.stop);
+	@shutdown(self, &self.low_pool, self.low_pool.stop);
 }
 
-macro void @shutdown(PoolData #pool, #stop) @local
+macro void @shutdown(ThreadPool* self, PoolData* pool, bool #stop) @local
 {
-	if (#pool.initialized)
+	if (pool.initialized)
 	{
-		#pool.mutex.lock();
+		pool.mutex.lock();
 		#stop = true;
-		#pool.cond_task_acquired.broadcast();
-		#pool.mutex.unlock();
+		pool.cond_task_acquired.broadcast();
+		pool.mutex.unlock();
 		// Wait for all threads to shutdown.
 		while (true)
 		{
-			#pool.mutex.lock();
-			defer #pool.mutex.unlock();
-			if (#pool.busy_thread_count == 0)
+			pool.mutex.lock();
+			defer pool.mutex.unlock();
+			if (!self.high_threads_working.or() && !self.low_threads_working.or())
 			{
 				break;
 			}
-			#pool.cond_task_acquired.signal();
+			pool.cond_task_acquired.signal();
 		}
-		#pool.mutex.destroy();
-		#pool.cond_task_acquired.destroy();
-		#pool.cond_task_finished.destroy();
-		#pool.cond_collect.destroy();
-		#pool.initialized = false;
+		pool.mutex.destroy();
+		pool.cond_task_acquired.destroy();
+		pool.cond_task_finished.destroy();
+		pool.cond_collect.destroy();
+		pool.initialized = false;
 	}
 }

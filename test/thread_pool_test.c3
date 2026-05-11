@@ -20,15 +20,15 @@ fn void general() @test
 	ThreadArena thread_alloc;
 	thread_alloc.init(mem, 1ull << 32);
 
-	ThreadPool{8, 4} pool;
-	pool.init()!!;
+	const TASK_COUNT = 100;
+
+	ThreadPool{4, 4, TASK_COUNT, TASK_COUNT} pool;
+	pool.init(mem, &thread_alloc)!!;
 
 	defer {
 		pool.stop_and_destroy();
 		thread_alloc.free();
 	}
-
-	const TASK_COUNT = 100;
 
 	ThreadTask[TASK_COUNT] compute_tasks;
 	int[TASK_COUNT] primes; 
@@ -41,9 +41,7 @@ fn void general() @test
 	foreach (i, &task : compute_tasks)
 	{
 		task.func = &task_computation;
-		task.data = (void*)&primes[i];
-		task.alloc = &thread_alloc;
-		task.priority = HIGH;
+		task.arg = (void*)&primes[i];
 	}
 
 	ThreadTask[TASK_COUNT] io_tasks;
@@ -52,13 +50,13 @@ fn void general() @test
 	foreach (i, &task : io_tasks)
 	{
 		task.func = &task_background;
-		task.data = (void*)&FILE_NAMES[random::rand(FILE_NAMES.len)];
-		task.alloc = &thread_alloc;
-		task.priority = HIGH;
+		task.arg = (void*)&FILE_NAMES[random::rand(FILE_NAMES.len)];
 	}
 
-	pool.submit_task_many(io_tasks[..]);
-	pool.submit_task_many(compute_tasks[..]);
+	ThreadTaskPack io_pack = { LOW, io_tasks[..] };
+	ThreadTaskPack compute_pack = { HIGH, compute_tasks[..] };
+	pool.submit_task_many((&io_pack)[:1]);
+	pool.submit_task_many((&compute_pack)[:1]);
 }
 
 fn void await_test() @test
@@ -66,8 +64,10 @@ fn void await_test() @test
 	ThreadArena thread_alloc;
 	thread_alloc.init(mem, 1ull << 32);
 
-	ThreadPool{2, 2} pool;
-	pool.init()!!;
+	const TASK_COUNT = FILE_NAMES.len;
+
+	ThreadPool{4, 4, TASK_COUNT, TASK_COUNT} pool;
+	pool.init(mem, &thread_alloc)!!;
 
 	defer {
 		pool.stop_and_destroy();
@@ -75,21 +75,17 @@ fn void await_test() @test
 		thread_alloc.free();
 	}
 
-	const TASK_COUNT = FILE_NAMES.len;
-
 	// First portion
 	ThreadTask[TASK_COUNT / 2] io_tasks_first;
 	
 	foreach (i, &task : io_tasks_first)
 	{
 		task.func = &task_background;
-		// task.data = (void*)&FILE_NAMES[i];
-		task.data = (void*)&FILE_NAMES[i + TASK_COUNT / 2];
-		task.alloc = &thread_alloc;
-		task.priority = LOW;
+		task.arg = (void*)&FILE_NAMES[i + TASK_COUNT / 2];
 	}
 
-	pool.submit_task_many(io_tasks_first[..]);
+	ThreadTaskPack io_pack = { LOW, io_tasks_first[..] };
+	pool.submit_task_many((&io_pack)[:1]);
 	pool.await_with_priority(LOW);
 	
 	// Second Portion
@@ -98,13 +94,11 @@ fn void await_test() @test
 	foreach (i, &task : io_tasks_second)
 	{
 		task.func = &task_background;
-		// task.data = (void*)&FILE_NAMES[i + TASK_COUNT / 2];
-		task.data = (void*)&FILE_NAMES[i];
-		task.alloc = &thread_alloc;
-		task.priority = LOW;
+		task.arg = (void*)&FILE_NAMES[i];
 	}
 
-	pool.submit_task_many(io_tasks_second[..]);
+	ThreadTaskPack io_pack_sec = { LOW, io_tasks_second[..] };
+	pool.submit_task_many((&io_pack_sec)[:1]);
 	pool.await_with_priority(LOW);
 }
 
@@ -116,11 +110,10 @@ import custom_allocators::arena;
 import data_structures::thread_pool;
 import std::atomic;
 
-fn void task_background(TaskData task)
+fn void task_background(void* arg)
 {
-	String f_name = *(String*)task.data;
-
-	ThreadArena* arena = (ThreadArena*)task.alloc;
+	String f_name = *(String*)arg;
+	ThreadArena* arena = (ThreadArena*)tmem;
 
 	arena.@temp_scope(; alloc)
 	{
@@ -155,9 +148,9 @@ fn void task_background(TaskData task)
 	};
 }
 
-fn void task_computation(TaskData task) 
+fn void task_computation(void* arg) 
 {
-	int start = *(int*)task.data;
+	int start = *(int*)arg;
 	int next_p = next_prime(start);
 }
 
