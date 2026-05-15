@@ -99,17 +99,19 @@ $endif
 *>
 fn void BuddyAlloc.free(&self)
 {
-$if THREAD_SAFE:
-	self.mutex.lock();
-	defer self.mutex.unlock();
-$endif
-	if (@likely(self.head != null))
 	{
-		alloc::free(self.backing_alloc, (char*)self.head - self.init_padding);
-	}
-	if (self.fallback_head != null)
-	{
-		free_fallback_allocations(self);
+	$if THREAD_SAFE:
+		self.mutex.lock();
+		defer self.mutex.unlock();
+	$endif
+		if (@likely(self.head != null))
+		{
+			alloc::free(self.backing_alloc, (char*)self.head - self.init_padding);
+		}
+		if (self.fallback_head != null)
+		{
+			free_fallback_allocations(self);
+		}
 	}
 	*self = { };
 }

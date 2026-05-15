@@ -1,13 +1,14 @@
 module custom_allocators::bst;
 
 // Aliases for public use.
-alias BSTAllocator = BSTAlloc{false};
-alias ThreadBSTAllocator = BSTAlloc{true};
+alias BstAllocator = BstAlloc{false};
+alias ThreadBstAllocator = BstAlloc{true};
 
 module custom_allocators::bst <THREAD_SAFE>;
 import std::io;
 import std::math;
 import std::thread @norecurse;
+import std::collections::ringbuffer;
 
 const DEFAULT_CAPACITY	   = 4096;
 const MIN_BLOCK_SIZE       = mem::DEFAULT_MEM_ALIGNMENT + FreeNode::size;
@@ -21,18 +22,18 @@ const MIN_CAPACITY         = MIN_BLOCK_SIZE * 4;
  When the allocator exhausts its memory or fragmentation becomes too high, it falls back to its backing allocator. Fallback allocations are automatically freed when the allocator is destroyed; the user must not free them manually.
  Fallback allocations can also be resized.
 *>
-struct BSTAlloc (Allocator, Printable) @private
+struct BstAlloc (Allocator, Printable) @private
 {
 	char* data;
 	sz capacity;
 	FreeNode* root;
 	FallbackAlloc* fallback_root;
-	BSTAllocStrategy strategy;
+	BstAllocStrategy strategy;
 	Allocator backing_alloc;
 	Mutex mutex @if(THREAD_SAFE);
 }
 
-enum BSTAllocStrategy
+enum BstAllocStrategy
 {
 	BEST_FIT,
 	FIRST_FIT,
@@ -81,11 +82,11 @@ struct FallbackAlloc @local
 
  @require init_capacity > MIN_CAPACITY : "Capacity should be greater than minimum capacity"
 *>
-fn void BSTAlloc.init(
+fn void BstAlloc.init(
 	&self,
 	Allocator backing_alloc = mem,
 	sz init_capacity = DEFAULT_CAPACITY,
-	BSTAllocStrategy strategy = BEST_FIT,
+	BstAllocStrategy strategy = BEST_FIT,
 )
 {
 	*self = {};
@@ -110,19 +111,19 @@ $endif
  @require alignment <= mem::MAX_MEMORY_ALIGNMENT : `alignment too big`
  @require size > 0
 *>
-fn void*? BSTAlloc.acquire(&self, sz size, AllocInitType init_type, sz alignment = 0) @dynamic
+fn void*? BstAlloc.acquire(&self, sz size, AllocInitType init_type, sz alignment = 0) @dynamic
 {
 $if THREAD_SAFE:
 	self.mutex.lock();
 	defer self.mutex.unlock();
 $endif
-	return _acquire(self, size, init_type, alignment);
+	return _acquire(self, size, init_type, alignment)!;
 }
 
 <*
  Non-locking 'acquire' procedure body, required for 'resize' which locks.
 *>
-macro void*? _acquire(BSTAlloc* self, sz size, AllocInitType init_type, sz alignment = 0) @local
+macro void*? _acquire(BstAlloc* self, sz size, AllocInitType init_type, sz alignment = 0) @local
 {
 	alignment = allocators::alignment_for_allocation(alignment);
 	sz aligned_size = mem::aligned_offset(size + AllocHeader::size, alignment);
@@ -143,7 +144,7 @@ macro void*? _acquire(BSTAlloc* self, sz size, AllocInitType init_type, sz align
 		return make_fallback_allocation(self, aligned_size, init_type)!;
 	}
 
-	remove_node(&self.root, node);
+	remove_node(self, node);
 
 	// Try to insert a new node, if have enough space.
 	sz diff = node.size - aligned_size;
@@ -151,7 +152,7 @@ macro void*? _acquire(BSTAlloc* self, sz size, AllocInitType init_type, sz align
 	{
 		FreeNode* new_node = node_at_offset(node, aligned_size);
 		init_node(new_node, diff, node);
-		insert_node(&self.root, new_node);
+		insert_node(self, new_node);
 		node.size = aligned_size;
 	}
 
@@ -172,7 +173,7 @@ macro void*? _acquire(BSTAlloc* self, sz size, AllocInitType init_type, sz align
  @require size > 0
  @return ? mem::INVALID_ALLOC_SIZE, mem::OUT_OF_MEMORY
 *>
-fn void*? BSTAlloc.resize(&self, void* old_pointer, sz size, sz alignment) @dynamic
+fn void*? BstAlloc.resize(&self, void* old_pointer, sz size, sz alignment) @dynamic
 {
 $if THREAD_SAFE:
 	self.mutex.lock();
@@ -198,7 +199,7 @@ $endif
 		{
 			FreeNode* new_node = node_next(node);
 			init_node(new_node, diff, node);
-			insert_node(&self.root, new_node);
+			insert_node(self, new_node);
 		}
 		return old_pointer;
 	}
@@ -217,14 +218,14 @@ $endif
 			node.size += diff;
 			new_node = node_next(node);
 			init_node(new_node, new_node_size, node);
-			remove_node(&self.root, next);
-			insert_node(&self.root, new_node);
+			remove_node(self, next);
+			insert_node(self, new_node);
 		}
 		// Or just consume all space of the next node.
 		else
 		{
 			node.size += next.size;
-			remove_node(&self.root, next);
+			remove_node(self, next);
 		}
 		return old_pointer;
 	}
@@ -242,11 +243,11 @@ $endif
 
  @require ptr != null : "Shouldn't be null"
 *>
-fn void BSTAlloc.release(&self, void* ptr, bool) @dynamic
+fn void BstAlloc.release(&self, void* ptr, bool) @dynamic
 {
 $if THREAD_SAFE:
 	self.mutex.lock();
-	defer self.mutex.unlock();
+	self.mutex.unlock();
 $endif
 	_release(self, ptr);
 }
@@ -254,32 +255,36 @@ $endif
 <*
  Non-locking 'acquire' procedure body, required for 'resize' which locks.
 *>
-macro void _release(BSTAlloc* self, void* ptr) @local
+macro void _release(BstAlloc* self, void* ptr) @local
 {
 	if (!owns_pointer(self, ptr)) return;
 	FreeNode* free_node = (FreeNode*)((AllocHeader*)ptr - 1);
+
 	// Prevent double free.
 	if (@unlikely(free_node.is_free)) return;
 
-	// Zero previously allocated memory.
-	free_node.parent = null;
-	free_node.left = null;
-	free_node.right = null;
-
 	// Order of this lines should be preserved.
 	free_node = coalesce_nodes_around(self, free_node);
-	insert_node(&self.root, free_node);
+	zero_node_links(free_node);
+	insert_node(self, free_node);
 }
 
 <*
  Frees resources of the allocator.
 *>
-fn void BSTAlloc.free(&self)
+fn void BstAlloc.free(&self)
 {
 $if THREAD_SAFE:
 	self.mutex.lock();
-	defer self.mutex.unlock();
 $endif
+	defer
+	{
+	$if THREAD_SAFE:
+		self.mutex.unlock();
+	$endif
+		*self = { };
+	}
+
 	if (@likely(self.data != null))
 	{
 		alloc::free(self.backing_alloc, self.data);
@@ -288,13 +293,12 @@ $endif
 	{
 		free_fallback_allocations(self);
 	}
-	*self = { };
 }
 
 <*
  Resets the state of the allocator making it available for reuse.
 *>
-fn void BSTAlloc.reset(&self)
+fn void BstAlloc.reset(&self)
 {
 $if THREAD_SAFE:
 	self.mutex.lock();
@@ -306,7 +310,7 @@ $endif
 <*
  Non-locking body of 'reset' procedure.
 *>
-macro void _reset(BSTAlloc* self)
+macro void _reset(BstAlloc* self)
 {
 	self.root = (FreeNode*)self.data;
 	init_node(self.root, self.capacity, null);
@@ -318,7 +322,7 @@ macro void _reset(BSTAlloc* self)
  @require self.root != null : "Must be initialized"
  @require tail_ref(self) != null : "Must be initialized"
 *>
-fn sz? BSTAlloc.to_format(&self, Formatter* fmt) @dynamic
+fn sz? BstAlloc.to_format(&self, Formatter* fmt) @dynamic
 {
 $if THREAD_SAFE:
 	self.mutex.lock();
@@ -360,7 +364,7 @@ $endif
 <*
  Print total memory usage statistics.
 *>
-fn sz? print_total_usage(BSTAlloc* self, Formatter* fmt, sz main_buff_used) @local
+fn sz? print_total_usage(BstAlloc* self, Formatter* fmt, sz main_buff_used) @local
 {
 	sz fallback_used = calc_used_fallback_mem(self);
 	sz main_buff_remain = self.capacity - main_buff_used;
@@ -393,7 +397,7 @@ fn sz? print_total_usage(BSTAlloc* self, Formatter* fmt, sz main_buff_used) @loc
  Tries to find node based on best fit strategy.
  (node with minimal required space is returned).
 *>
-fn FreeNode* find_node_best_fit(BSTAlloc* self, sz req_size) @local
+fn FreeNode* find_node_best_fit(BstAlloc* self, sz req_size) @local
 {
 	if (!self.root) return null;
 
@@ -421,7 +425,7 @@ fn FreeNode* find_node_best_fit(BSTAlloc* self, sz req_size) @local
  Tries to find node based on first fit strategy.
  (first appropriate node is returned).
 *>
-fn FreeNode* find_node_first_fit(BSTAlloc* self, sz req_size) @local
+fn FreeNode* find_node_first_fit(BstAlloc* self, sz req_size) @local
 {
 	if (!self.root) return null;
 
@@ -455,11 +459,25 @@ fn void init_node(FreeNode* node, sz size, FreeNode* prev_phys) @local
 }
 
 <*
- BST insertion.
- Inserts the node into the tree of free nodes, making it available for future allocations.
+ Zeroes node's tree pointers.
 *>
-fn void insert_node(FreeNode** root, FreeNode* new_node) @local
+fn void zero_node_links(FreeNode* node) @local
 {
+	node.left = null;
+	node.right = null;
+	node.parent = null;
+}
+
+<*
+ Bst insertion.
+ Inserts the node into the tree of free nodes, making it available for future allocations.
+
+ @require new_node.left == null && new_node.right == null && new_node.parent == null : "Links should be null before insertion"
+*>
+fn void insert_node(BstAlloc* self, FreeNode* new_node) @local
+{
+	FreeNode** root = &self.root;
+
 	new_node.is_free = true;
 
 	if (!*root)
@@ -502,13 +520,15 @@ fn void insert_node(FreeNode** root, FreeNode* new_node) @local
 }
 
 <*
- BST removal.
+ Bst removal.
  Removes the node from the tree of free nodes, so its memory can be provided to the user.
 
  @require node_to_remove != null : "Shoudn't be null"
 *>
-fn void remove_node(FreeNode** root, FreeNode* node_to_remove) @local
+fn void remove_node(BstAlloc* self, FreeNode* node_to_remove) @local
 {
+	FreeNode** root = &self.root;
+
 	node_to_remove.is_free = false;
 
 	if (*root == node_to_remove)
@@ -523,7 +543,38 @@ fn void remove_node(FreeNode** root, FreeNode* node_to_remove) @local
 		}
 		else
 		{
-			*root = find_node_succeessor(node_to_remove);
+			FreeNode* successor = find_node_successor(node_to_remove);
+
+	        // Detach successor from its old position
+	        if (successor != node_to_remove.right)
+	        {
+	            FreeNode* succ_parent = successor.parent;
+	            // successor has no left child
+	            succ_parent.left = successor.right;
+	            if (successor.right)
+	            {
+	                successor.right.parent = succ_parent;
+	            }
+	            // The right subtree for successor is still node_to_remove.right
+	            successor.right = node_to_remove.right;
+	            if (successor.right)
+	            {
+	                successor.right.parent = successor;
+	            }
+	        }
+	        else
+	        {
+	            // successor == node_to_remove.right
+	            // So successor's right child should be successor.right (original)
+	            successor.right = successor.right;
+	        }
+
+	        successor.left = node_to_remove.left;
+	        successor.left.parent = successor;
+
+	        successor.parent = null;
+	        *root = successor;
+			return;
 		}
 
 		// Root should not have parent if its not null.
@@ -557,11 +608,32 @@ fn void remove_node(FreeNode** root, FreeNode* node_to_remove) @local
 		}
 		else
 		{
-			FreeNode* successor = find_node_succeessor(node_to_remove);
-			parent.left = successor;
-			if (successor) {
-				successor.parent = parent;
+			// Two children: use inorder successor
+			FreeNode* successor = find_node_successor(node_to_remove);
+
+			// Detach successor from its old position
+			if (successor != node_to_remove.right)
+			{
+			    FreeNode* succ_parent = successor.parent;
+			    succ_parent.left = successor.right;
+			    if (successor.right)
+			    {
+			        successor.right.parent = succ_parent;
+			    }
 			}
+
+			// Attach successor in place of node_to_remove
+			successor.left = node_to_remove.left;
+			successor.left.parent = successor;
+
+			successor.right = node_to_remove.right;
+			if (successor.right)
+			{
+			    successor.right.parent = successor;
+			}
+
+			successor.parent = parent;
+			parent.left = successor;		
 		}
 	}
 	else
@@ -584,11 +656,32 @@ fn void remove_node(FreeNode** root, FreeNode* node_to_remove) @local
 		}
 		else
 		{
-			FreeNode* successor = find_node_succeessor(node_to_remove);
-			parent.right = successor;
-			if (successor) {
-				successor.parent = parent;
+			// Two children: use inorder successor
+			FreeNode* successor = find_node_successor(node_to_remove);
+
+			// Detach successor from its old position
+			if (successor != node_to_remove.right)
+			{
+			    FreeNode* succ_parent = successor.parent;
+			    succ_parent.left = successor.right;
+			    if (successor.right)
+			    {
+			        successor.right.parent = succ_parent;
+			    }
 			}
+
+			// Attach successor in place of node_to_remove
+			successor.left = node_to_remove.left;
+			successor.left.parent = successor;
+
+			successor.right = node_to_remove.right;
+			if (successor.right)
+			{
+			    successor.right.parent = successor;
+			}
+
+			successor.parent = parent;
+			parent.right = successor;
 		}
 	}
 }
@@ -596,15 +689,17 @@ fn void remove_node(FreeNode** root, FreeNode* node_to_remove) @local
 <*
  Gets the smallest node in the right subtree.
  Used in remove_node.
+
+ @ensure return != null : "Return value can't be null"
 *>
-fn FreeNode* find_node_succeessor(FreeNode* node) @inline @local
+fn FreeNode* find_node_successor(FreeNode* node) @inline @local
 {
-	node = node.right;
-	while (node && node.left)
+	FreeNode* res = node.right;
+	while (res && res.left)
 	{
-		node = node.left;
+		res = res.left;
 	}
-	return node;
+	return res;
 }
 
 <*
@@ -613,7 +708,7 @@ fn FreeNode* find_node_succeessor(FreeNode* node) @inline @local
  @return "Returns node that was possibly moved to new address"
  @require node != null : "Shoudn't be null"
 *>
-fn FreeNode* coalesce_nodes_around(BSTAlloc* self, FreeNode* node) @local
+fn FreeNode* coalesce_nodes_around(BstAlloc* self, FreeNode* node) @local
 {
 	FreeNode* next = node_next(node);
 	FreeNode* tail = tail_ref(self);
@@ -622,7 +717,7 @@ fn FreeNode* coalesce_nodes_around(BSTAlloc* self, FreeNode* node) @local
 	if (next < tail && next.is_free)
 	{
 		node.size += next.size;
-		remove_node(&self.root, next);
+		remove_node(self, next);
 		was_merge = true;
 	}
 
@@ -631,7 +726,7 @@ fn FreeNode* coalesce_nodes_around(BSTAlloc* self, FreeNode* node) @local
 	{
 		prev.size += node.size;
 		node = prev;
-		remove_node(&self.root, prev);
+		remove_node(self, prev);
 		was_merge = true;
 	}
 
@@ -652,7 +747,7 @@ fn FreeNode* coalesce_nodes_around(BSTAlloc* self, FreeNode* node) @local
 
  @require ptr != null : "Shoudn't be null"
 *>
-fn bool owns_pointer(BSTAlloc* self, void* ptr) @inline @local
+fn bool owns_pointer(BstAlloc* self, void* ptr) @inline @local
 {
 	return ptr >= self.data && ptr < (self.data + self.capacity);
 }
@@ -681,7 +776,7 @@ fn FreeNode* node_at_offset(FreeNode* node, sz offset) @inline @local
 <*
  Returns a tail node of the allocator, which serves as a memory buffer boundary.
 *>
-fn FreeNode* tail_ref(BSTAlloc* self) @inline @local
+fn FreeNode* tail_ref(BstAlloc* self) @inline @local
 {
 	return (FreeNode*)(self.data + self.capacity);
 }
@@ -691,7 +786,7 @@ fn FreeNode* tail_ref(BSTAlloc* self) @inline @local
 
  @require size > 0 : "Should be bigger than 0"
 *>
-fn void*? make_fallback_allocation(BSTAlloc* self, sz size, AllocInitType init_type) @local
+fn void*? make_fallback_allocation(BstAlloc* self, sz size, AllocInitType init_type) @local
 {
 	FallbackAlloc* curr = self.fallback_root;
 	while (curr)
@@ -721,7 +816,7 @@ fn void*? make_fallback_allocation(BSTAlloc* self, sz size, AllocInitType init_t
  @require old_ptr != null : "Shouldn't be null"
  @require new_size > 0 : "Should be bigger than 0"
 *>
-fn void*? resize_fallback_allocation(BSTAlloc* self, void* old_ptr, sz new_size) @local
+fn void*? resize_fallback_allocation(BstAlloc* self, void* old_ptr, sz new_size) @local
 {
 	FallbackAlloc* curr = self.fallback_root;
 	FallbackAlloc* alloc = null;
@@ -747,7 +842,7 @@ fn void*? resize_fallback_allocation(BSTAlloc* self, void* old_ptr, sz new_size)
 <*
  Cleans up all fallback allocations.
 *>
-fn void free_fallback_allocations(BSTAlloc* self) @local
+fn void free_fallback_allocations(BstAlloc* self) @local
 {
 	FallbackAlloc* curr = self.fallback_root;
 	while (curr)
@@ -762,7 +857,7 @@ fn void free_fallback_allocations(BSTAlloc* self) @local
 <*
  Calculates all memory that were allocated as a fallback.
 *>
-fn sz calc_used_fallback_mem(BSTAlloc* self) @local
+fn sz calc_used_fallback_mem(BstAlloc* self) @local
 {
 	sz res = 0;
 	FallbackAlloc* curr = self.fallback_root;
@@ -772,4 +867,87 @@ fn sz calc_used_fallback_mem(BSTAlloc* self) @local
 		curr = curr.next;
 	}
 	return res;
+}
+
+// --- Debugging ---
+
+alias NodeCallback = fn void(FreeNode* node);
+
+<*
+ Prints tree nodes in BFS for debugging purposes.
+
+ @require self.root != null : "Root should be available"
+*>
+fn void debug_print_tree(BstAlloc* self) @local
+{
+	traverse_tree_bfs(self, &print_node_cb);
+}
+
+<*
+ Detects cyclic references recursively starting from provided node.
+
+ @require node != null : "Node shouldn't be null"
+*>
+fn void detect_cyclic_refs(FreeNode* node) @local
+{
+	if (node == node.left)
+	{
+		io::printfn("Cyclic ref detected!: node: %p, left child: %p", node, node.left);
+	}
+	if (node == node.right)
+	{
+		io::printfn("Cyclic ref detected!: node: %p, right child: %p", node, node.right);
+	}
+	if (node == node.parent)
+	{
+		io::printfn("Cyclic ref detected!: node: %p, parent child: %p", node, node.parent);
+	}
+
+	if (node.left)
+	{
+		detect_cyclic_refs(node.left);
+	}
+	if (node.right)
+	{
+		detect_cyclic_refs(node.right);
+	}
+}
+
+<*
+ Traverses tree (BFS) for debugging purposes.
+
+ @require self.root != null : "Root should be available"
+ @require node_callback != null : "Callback should be provided"
+*>
+fn void traverse_tree_bfs(BstAlloc* self, NodeCallback node_callback) @local
+{
+	const MAX_NODES = 100;
+	RingBuffer{FreeNode*, MAX_NODES} rbuf;
+	rbuf.init();
+
+	FreeNode* curr = null;
+	sz curr_len = 0;
+	sz tree_height = 0;
+	
+	rbuf.push(self.root);
+
+	while ((curr_len = rbuf.len()))
+	{
+		io::printfn("current tree height: %d", tree_height);
+		io::printn("[");
+		for (sz i = 0; i < curr_len; ++i)
+		{
+			curr = rbuf.pop_first()!!;
+			node_callback(curr);
+			if (curr.left) rbuf.push(curr.left);
+			if (curr.right) rbuf.push(curr.right);
+		}
+		io::printn("]");
+		++tree_height;
+	}
+}
+
+fn void print_node_cb(FreeNode* node) @local
+{
+	io::printfn("\tNode: %p, left: %p, right: %p, parent: %p", node, node.left, node.right, node.parent);
 }
